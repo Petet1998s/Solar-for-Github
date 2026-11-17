@@ -1,6 +1,6 @@
 import hmac
+import logging
 import os
-import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -56,6 +56,7 @@ request_times = defaultdict(deque)
 
 
 def rate_allowed(key):
+    """Best-effort per-process limiter; use host-level/shared limits for public deployments."""
     now = time.monotonic()
     with rate_lock:
         bucket = request_times[key]
@@ -68,9 +69,15 @@ def rate_allowed(key):
 
 
 def csrf_valid():
-    supplied = request.headers.get("X-CSRF-Token", "")
+    supplied = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf_token", "")
     expected = session.get("csrf_token", "")
     return bool(supplied and expected and hmac.compare_digest(supplied, expected))
+
+
+def new_csrf_token():
+    token = os.urandom(32).hex()
+    session["csrf_token"] = token
+    return token
 
 
 def call_model(agent_id, messages, max_tokens=700):
@@ -93,7 +100,10 @@ def call_model(agent_id, messages, max_tokens=700):
 
 @app.after_request
 def add_security_headers(response):
-    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -111,29 +121,42 @@ def health():
 def login_page():
     if session.get("authenticated"):
         return redirect(url_for("home"))
-    return render_template("login.html", error=None)
+    if not session.get("csrf_token"):
+        new_csrf_token()
+    return render_template("login.html", error=None, csrf_token=session["csrf_token"])
 
 
 @app.post("/login")
 def login():
+    if not csrf_valid():
+        if not session.get("csrf_token"):
+            new_csrf_token()
+        return render_template(
+            "login.html", error="คำขอไม่ผ่านการตรวจสอบความปลอดภัย", csrf_token=session["csrf_token"]
+        ), 403
     ip = request.remote_addr or "unknown"
     if not rate_allowed("login:" + ip):
-        return render_template("login.html", error="ลองใหม่ภายหลัง"), 429
+        return render_template("login.html", error="ลองใหม่ภายหลัง", csrf_token=session["csrf_token"]), 429
     username = request.form.get("username", "")[:128]
     password = request.form.get("password", "")[:256]
     if hmac.compare_digest(username, APP_USERNAME) and hmac.compare_digest(password, APP_PASSWORD):
         session.clear()
         session.permanent = True
+        token = new_csrf_token()
         session["authenticated"] = True
-        session["csrf_token"] = os.urandom(32).hex()
+        session["csrf_token"] = token
         return redirect(url_for("home"))
-    return render_template("login.html", error="ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"), 401
+    return render_template(
+        "login.html", error="ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", csrf_token=session["csrf_token"]
+    ), 401
 
 
 @app.post("/logout")
 def logout():
-    if not session.get("authenticated") or not csrf_valid():
+    if not session.get("authenticated"):
         return "Unauthorized", 401
+    if not csrf_valid():
+        return "Forbidden", 403
     session.clear()
     return redirect(url_for("login_page"))
 
@@ -143,7 +166,7 @@ def home():
     if not session.get("authenticated"):
         return redirect(url_for("login_page"))
     if not session.get("csrf_token"):
-        session["csrf_token"] = os.urandom(32).hex()
+        new_csrf_token()
     return render_template("index.html", agents=AGENTS, csrf_token=session["csrf_token"])
 
 
@@ -184,26 +207,30 @@ def chat():
     council = payload.get("council") is True
     if not council and agent_id not in AGENTS:
         return jsonify(error="ไม่พบ Agent ที่เลือก"), 400
-    if council:
-        messages = [messages[-1]]
 
     if council:
+        # Bound active calls and return at the overall deadline without waiting for
+        # already-running provider requests. Those calls still have a 45s provider timeout.
+        messages = [messages[-1]]
         results = {}
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            jobs = {pool.submit(call_model, key, messages, 250): key for key in AGENTS}
-            try:
-                for future in as_completed(jobs, timeout=60):
-                    key = jobs[future]
-                    try:
-                        results[key] = future.result()
-                    except Exception:
-                        results[key] = "Agent ไม่พร้อมใช้งานในขณะนี้"
-            except TimeoutError:
-                for future, key in ((f, jobs[f]) for f in jobs if f not in results):
+        pool = ThreadPoolExecutor(max_workers=3)
+        jobs = {pool.submit(call_model, key, messages, 250): key for key in AGENTS}
+        try:
+            for future in as_completed(jobs, timeout=50):
+                key = jobs[future]
+                try:
+                    results[key] = future.result()
+                except Exception:
+                    results[key] = "Agent ไม่พร้อมใช้งานในขณะนี้"
+        except TimeoutError:
+            pass
+        finally:
+            for future in jobs:
+                if not future.done():
                     future.cancel()
-                    results[key] = "หมดเวลารอคำตอบจาก Agent"
+            pool.shutdown(wait=False, cancel_futures=True)
         ordered = [
-            {"name": AGENTS[key][0], "text": results.get(key, "Agent ไม่พร้อมใช้งานในขณะนี้")}
+            {"name": AGENTS[key][0], "text": results.get(key, "หมดเวลารอคำตอบจาก Agent")}
             for key in AGENTS
         ]
         return jsonify(council=ordered)
